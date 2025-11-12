@@ -1,0 +1,130 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+from ultralytics import YOLO
+import numpy as np
+from pathlib import Path
+import os
+import tempfile
+import urllib.request
+import shutil
+
+app = FastAPI()
+
+_models = {}
+
+class BBox(BaseModel):
+    x: float
+    y: float
+    width: float
+    height: float
+
+class Item(BaseModel):
+    classId: int
+    class_: str
+    confidence: float
+    bbox: BBox
+
+class Summary(BaseModel):
+    hasIssue: bool
+    issueType: str
+    objectCount: int
+    avgScore: float
+
+class DetectRequest(BaseModel):
+    image_path: str
+    model_path: Optional[str] = None
+    conf: Optional[float] = 0.25
+    iou: Optional[float] = 0.5
+
+class DetectResponse(BaseModel):
+    success: bool
+    items: List[Item]
+    summary: Summary
+
+def _get_model(path: Optional[str]):
+    key = path or "yolov8n.pt"
+    m = _models.get(key)
+    if m is None:
+        m = YOLO(key)
+        _models[key] = m
+    return m
+
+BASE_DIR = Path(os.environ.get("UPLOADS_BASE_DIR", r"B:\\yolo_env\\deepLearning\\foreignscan-windows"))
+
+def normalize_path(p: str) -> str:
+    if p.startswith("/") and len(p) > 2 and p[1].isalpha() and p[2] == ":":
+        p = p[1:]
+    q = Path(p)
+    if not q.is_absolute():
+        q = BASE_DIR / q
+    return str(q.resolve())
+
+def _download(url: str, suffix: str):
+    fd, tmp = tempfile.mkstemp(suffix=suffix or ".tmp")
+    os.close(fd)
+    with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
+        shutil.copyfileobj(r, f)
+    return tmp
+
+def resolve_source(p: str):
+    s = p.strip()
+    if s.lower().startswith("http://") or s.lower().startswith("https://"):
+        tmp = _download(s, Path(s).suffix)
+        return tmp, True
+    q = Path(s)
+    if not q.is_absolute():
+        hb = os.environ.get("UPLOADS_HTTP_BASE", "").rstrip("/")
+        if hb:
+            url = f"{hb}/{q.as_posix()}"
+            tmp = _download(url, q.suffix)
+            return tmp, True
+        path = normalize_path(s)
+        if not Path(path).is_file() and hb:
+            url = f"{hb}/{q.as_posix()}"
+            tmp = _download(url, q.suffix)
+            return tmp, True
+        return path, False
+    return str(q), False
+
+def detect_impl(req: DetectRequest) -> DetectResponse:
+    model = _get_model(req.model_path)
+    source, cleanup = resolve_source(req.image_path)
+    if not Path(source).is_file():
+        raise HTTPException(status_code=400, detail=f"file not found: {source}")
+    try:
+        results = model.predict(source=source, conf=req.conf, iou=req.iou, verbose=False)
+    finally:
+        if cleanup:
+            try:
+                os.remove(source)
+            except Exception:
+                pass
+    items: List[Item] = []
+    names = model.names
+    for r in results:
+        if r.boxes is None:
+            continue
+        xywh = r.boxes.xywh.cpu().numpy() if hasattr(r.boxes, "xywh") else None
+        cls = r.boxes.cls.cpu().numpy().astype(int) if hasattr(r.boxes, "cls") else None
+        conf = r.boxes.conf.cpu().numpy() if hasattr(r.boxes, "conf") else None
+        if xywh is None or cls is None or conf is None:
+            continue
+        for i in range(xywh.shape[0]):
+            x, y, w, h = xywh[i].tolist()
+            cid = int(cls[i])
+            score = float(conf[i])
+            cname = names[cid] if names and cid in names else str(cid)
+            items.append(Item(classId=cid, class_=cname, confidence=score, bbox=BBox(x=x, y=y, width=w, height=h)))
+    count = len(items)
+    avg = float(np.mean([it.confidence for it in items])) if count > 0 else 0.0
+    summary = Summary(hasIssue=False, issueType="", objectCount=count, avgScore=avg)
+    return DetectResponse(success=True, items=items, summary=summary)
+
+@app.post("/api/detect", response_model=DetectResponse)
+def detect_api(req: DetectRequest):
+    return detect_impl(req)
+
+@app.post("/detect", response_model=DetectResponse)
+def detect_legacy(req: DetectRequest):
+    return detect_impl(req)
