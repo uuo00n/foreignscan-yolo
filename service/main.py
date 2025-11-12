@@ -8,6 +8,8 @@ import os
 import tempfile
 import urllib.request
 import shutil
+from urllib.parse import urlparse
+import hashlib
 
 app = FastAPI()
 
@@ -41,6 +43,7 @@ class DetectResponse(BaseModel):
     success: bool
     items: List[Item]
     summary: Summary
+    labeledPath: Optional[str] = None
 
 def _get_model(path: Optional[str]):
     key = path or "yolov8n.pt"
@@ -51,6 +54,7 @@ def _get_model(path: Optional[str]):
     return m
 
 BASE_DIR = Path(os.environ.get("UPLOADS_BASE_DIR", r"B:\\yolo_env\\deepLearning\\foreignscan-windows"))
+LABELS_BASE_DIR = Path(os.environ.get("LABELS_BASE_DIR", r"B:\\yolo_env\\deepLearning\\foreignscan-backend\\cmd\\server\\uploads\\labels"))
 
 def normalize_path(p: str) -> str:
     if p.startswith("/") and len(p) > 2 and p[1].isalpha() and p[2] == ":":
@@ -87,11 +91,55 @@ def resolve_source(p: str):
         return path, False
     return str(q), False
 
+def _extract_scene_and_filename(p: str):
+    s = p.strip()
+    if s.lower().startswith("http://") or s.lower().startswith("https://"):
+        u = urlparse(s)
+        parts = Path(u.path).parts
+    else:
+        parts = Path(s.replace("\\", "/")).parts
+    try:
+        i = parts.index("uploads")
+        if i + 2 < len(parts) and parts[i + 1] == "images":
+            scene = parts[i + 2]
+            fname = parts[i + 3] if i + 3 < len(parts) else None
+            if scene and fname:
+                return scene, fname
+    except ValueError:
+        pass
+    return None, None
+
+def _save_labeled_image(r, dest_path: Path):
+    try:
+        from PIL import Image
+        img = r.plot()
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(img).save(str(dest_path))
+        return True
+    except Exception:
+        try:
+            import cv2
+            img = r.plot()
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(dest_path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+            return True
+        except Exception:
+            return False
+
 def detect_impl(req: DetectRequest) -> DetectResponse:
     model = _get_model(req.model_path)
     source, cleanup = resolve_source(req.image_path)
     if not Path(source).is_file():
         raise HTTPException(status_code=400, detail=f"file not found: {source}")
+    scene, fname = _extract_scene_and_filename(req.image_path)
+    out_rel = None
+    if scene and fname:
+        out_rel = Path("uploads") / "labels" / scene / fname
+    else:
+        h = hashlib.sha1(req.image_path.encode("utf-8")).hexdigest()[:12]
+        base = Path(source).name or "image.jpg"
+        out_rel = Path("uploads") / "labels" / h / base
+    out_abs = LABELS_BASE_DIR / Path(out_rel).parts[-2] / Path(out_rel).name if out_rel else None
     try:
         results = model.predict(source=source, conf=req.conf, iou=req.iou, verbose=False)
     finally:
@@ -116,10 +164,12 @@ def detect_impl(req: DetectRequest) -> DetectResponse:
             score = float(conf[i])
             cname = names[cid] if names and cid in names else str(cid)
             items.append(Item(classId=cid, class_=cname, confidence=score, bbox=BBox(x=x, y=y, width=w, height=h)))
+    if len(results) > 0 and out_abs is not None:
+        _save_labeled_image(results[0], out_abs)
     count = len(items)
     avg = float(np.mean([it.confidence for it in items])) if count > 0 else 0.0
     summary = Summary(hasIssue=False, issueType="", objectCount=count, avgScore=avg)
-    return DetectResponse(success=True, items=items, summary=summary)
+    return DetectResponse(success=True, items=items, summary=summary, labeledPath=str(out_rel).replace("\\", "/") if out_rel else None)
 
 @app.post("/api/detect", response_model=DetectResponse)
 def detect_api(req: DetectRequest):
