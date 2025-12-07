@@ -46,7 +46,12 @@ class DetectResponse(BaseModel):
     labeledPath: Optional[str] = None
 
 def _get_model(path: Optional[str]):
-    key = path or "yolov8n.pt"
+    # 强制使用指定模型，忽略传入的 yolov8s.pt 等默认值
+    default_model = r"b:\yolo_env\deepLearning\ultralytics-8.3.163\service\best.pt"
+    if not path or "yolov8" in path:
+        key = default_model
+    else:
+        key = path
     m = _models.get(key)
     if m is None:
         m = YOLO(key)
