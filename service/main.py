@@ -117,16 +117,19 @@ def _extract_scene_and_filename(p: str):
 def _save_labeled_image(r, dest_path: Path):
     try:
         from PIL import Image
-        img = r.plot()
+        img = r.plot(conf=False)
+        # r.plot() returns BGR, PIL expects RGB. Convert BGR to RGB.
+        img = img[..., ::-1]
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(img).save(str(dest_path))
         return True
     except Exception:
         try:
             import cv2
-            img = r.plot()
+            img = r.plot(conf=False)
             dest_path.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(dest_path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+            # r.plot() returns BGR, cv2.imwrite expects BGR. Save directly.
+            cv2.imwrite(str(dest_path), img)
             return True
         except Exception:
             return False
